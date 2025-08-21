@@ -212,6 +212,13 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
+        if os.environ["ENABLE_LM_CACHE"] == 1:
+            from lmcache.v1.compute.models.utils import VLLMModelTracker
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+                    
+            VLLMModelTracker.register_model(ENGINE_NAME, self.model_runner.model)
+            ensure_kv_transfer_initialized(self.vllm_config)
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
@@ -613,7 +620,8 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
-    ensure_kv_transfer_initialized(vllm_config)
+    if "ENABLE_LM_CACHE" not in os.environ or os.environ["ENABLE_LM_CACHE"] != 1:
+        ensure_kv_transfer_initialized(vllm_config)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
