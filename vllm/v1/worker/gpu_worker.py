@@ -272,6 +272,13 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
+        if os.environ["ENABLE_LM_CACHE"] == 1:
+            from lmcache.v1.compute.models.utils import VLLMModelTracker
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+                    
+            VLLMModelTracker.register_model(ENGINE_NAME, self.model_runner.model)
+            ensure_kv_transfer_initialized(self.vllm_config)
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
