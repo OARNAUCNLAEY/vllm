@@ -212,7 +212,7 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
-        if "ENABLE_LM_CACHE" in os.environ and os.environ["ENABLE_LM_CACHE"] == 1:
+        if "ENABLE_LM_CACHE" in os.environ and int(os.environ["ENABLE_LM_CACHE"]) == 1:
             from lmcache.v1.compute.models.utils import VLLMModelTracker
             from lmcache.integration.vllm.utils import ENGINE_NAME
                     
@@ -620,7 +620,7 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
-    if "ENABLE_LM_CACHE" not in os.environ or os.environ["ENABLE_LM_CACHE"] != 1:
+    if "ENABLE_LM_CACHE" not in os.environ or int(os.environ["ENABLE_LM_CACHE"]) != 1:
         ensure_kv_transfer_initialized(vllm_config)
 
 
