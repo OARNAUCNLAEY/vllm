@@ -799,6 +799,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
+            print(f"if -> query_start_loc {query_start_loc}")
             logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
         else:
@@ -813,6 +814,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
+            
+            print(f"else -> spec_decode_metadata {spec_decode_metadata.logits_indices}")
             logits_indices = spec_decode_metadata.logits_indices
 
         logits_indices_padded = None
@@ -1647,7 +1650,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.input_batch.pooling_params:
                 return self._pool(hidden_states, num_scheduled_tokens,
                                   num_scheduled_tokens_np, kv_connector_output)
-
+            print(f"Logits_indices: {logits_indices.shape}")
             sample_hidden_states = hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
         if broadcast_pp_output:
