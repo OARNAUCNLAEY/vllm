@@ -480,6 +480,7 @@ def unified_attention_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
+    skip_layer: bool = False
 ) -> torch.Tensor:
     return torch.empty_like(query).contiguous()
 
@@ -529,6 +530,7 @@ def unified_attention_with_output_fake(
     output: torch.Tensor,
     layer_name: str,
     output_scale: Optional[torch.Tensor] = None,
+    skip_layer: bool = False
 ) -> None:
     return
 
