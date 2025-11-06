@@ -439,6 +439,7 @@ class LlamaModel(nn.Module):
         if "SKIP_LAYERS_CUSTOM" in os.environ:
             for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
                 self.skip_layers[int(layer_id.strip())] = True
+                print(f"Layer skipped init: {int(layer_id.strip())}")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
