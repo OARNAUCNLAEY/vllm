@@ -568,6 +568,7 @@ class FlashAttentionImpl(AttentionImpl):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        skip_layer: Optional[bool] = False,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -649,7 +650,9 @@ class FlashAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-
+        if skip_layer:
+            # print(f"Skipping attention computation for this layer")
+            return None
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(

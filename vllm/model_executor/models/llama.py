@@ -26,6 +26,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
 
 import torch
 from torch import nn
@@ -238,6 +239,7 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        skip_layer: bool,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -245,7 +247,9 @@ class LlamaAttention(nn.Module):
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, skip_layer=skip_layer)
+        if skip_layer:
+            return None
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -336,18 +340,38 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        skip_layer: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        # print(hidden_states.shape)
+        if skip_layer:
+            hidden_states_old, residual_old = hidden_states.clone(), residual.clone()
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+            self.self_attn(positions=positions,
+                                        hidden_states=hidden_states,
+                                        skip_layer=skip_layer)
+    
+            return hidden_states_old, residual_old
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+            hidden_states = self.self_attn(positions=positions,
+                                        hidden_states=hidden_states,
+                                        skip_layer=skip_layer)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -406,9 +430,15 @@ class LlamaModel(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
+        
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_CUSTOM" in os.environ:
+            for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
+                self.skip_layers[int(layer_id.strip())] = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -432,12 +462,18 @@ class LlamaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        is_prefill = positions.shape[0] != 1
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            skip_layer = True if idx not in self.skip_layers and is_prefill else False
+            # if skip_layer:
+            #     print(f"Skipping layer {idx}, shape {positions.shape}")
+            # print(f"Layer idx {idx}")
+            hidden_states, residual = layer(positions, hidden_states, residual, skip_layer)
+            # print(f"shape {hidden_states.shape}")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
