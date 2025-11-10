@@ -273,6 +273,7 @@ class TritonAttentionImpl(AttentionImpl):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        skip_layer: Optional[bool] = False,
     ) -> torch.Tensor:
         """Forward pass with Paged Attention impl. in Triton.
 
@@ -335,7 +336,8 @@ class TritonAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-
+        if skip_layer:
+            return
         if self.kv_cache_dtype.startswith("fp8"):
             if key_cache.dtype != self.fp8_dtype:
                 key_cache = key_cache.view(self.fp8_dtype)

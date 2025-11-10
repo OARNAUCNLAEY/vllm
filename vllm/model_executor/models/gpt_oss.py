@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+import os
 
 import torch
 import torch.distributed as dist
@@ -128,14 +129,18 @@ class OAIAttention(nn.Module):
             sinks=self.sinks,
         )
 
+        
+
     def forward(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
+        self, hidden_states: torch.Tensor, positions: torch.Tensor, skip_layer: bool = False
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         v = v.contiguous()
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, skip_layer=skip_layer)
+        if skip_layer:
+            return None
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -223,7 +228,7 @@ class TransformerBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: torch.Tensor, skip_layer: bool = False | None,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -231,7 +236,9 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.attn(hidden_states, positions)
+        hidden_states = self.attn(hidden_states, positions, skip_layer=skip_layer)
+        if attn_output is None:
+            return None
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -266,6 +273,25 @@ class GptOssModel(nn.Module):
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_CUSTOM" in os.environ:
+            for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
+                self.skip_layers[int(layer_id.strip())] = True
+                print(f"Layer not skipped init: {int(layer_id.strip())}")
+
+
+    def forward(self, input_ids: torch.Tensor,
+                positions: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(input_ids)
+        is_prefill = positions.shape[0] != 1
+        for idx, layer in enumerate(self.layers):
+            skip_layer = True if idx not in self.skip_layers and is_prefill else False
+            if skip_layer:
+                layer(x, positions, skip_layer=skip_layer)
+            else:
+                x = layer(x, positions, skip_layer=skip_layer)
+        x = self.norm(x)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
