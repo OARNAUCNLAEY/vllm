@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from typing import Optional
+import os
 
 import torch
 import torch.distributed as dist
@@ -117,15 +118,19 @@ class OAIAttention(nn.Module):
             sinks=self.sinks,
         )
 
+        
+
     def forward(self, hidden_states: torch.Tensor,
-                positions: torch.Tensor) -> torch.Tensor:
+                positions: torch.Tensor, skip_layer: bool = False) -> torch.Tensor:
         t = self.norm(hidden_states)
 
         qkv, _ = self.qkv(t)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         v = v.contiguous()
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, skip_layer=skip_layer)
+        if skip_layer:
+            return None
         output, _ = self.o_proj(attn_output)
 
         return output + hidden_states
@@ -186,8 +191,10 @@ class TransformerBlock(torch.nn.Module):
                             prefix=f"{prefix}.mlp")
 
     def forward(self, hidden_states: torch.Tensor,
-                positions: torch.Tensor) -> torch.Tensor:
-        attn_output = self.attn(hidden_states, positions)
+                positions: torch.Tensor, skip_layer: bool = False) -> torch.Tensor:
+        attn_output = self.attn(hidden_states, positions, skip_layer=skip_layer)
+        if attn_output is None:
+            return None
         output = self.mlp(attn_output)
         return output
 
@@ -217,13 +224,26 @@ class GptOssModel(nn.Module):
                 prefix=maybe_prefix(prefix, f"block.{layer_idx}"),
             ) for layer_idx in range(self.config.num_hidden_layers)
         ])
+        print(f"NUM layers: {self.config.num_hidden_layers}")
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_CUSTOM" in os.environ:
+            for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
+                self.skip_layers[int(layer_id.strip())] = True
+                print(f"Layer not skipped init: {int(layer_id.strip())}")
+
 
     def forward(self, input_ids: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         x = self.embedding(input_ids)
-        for layer in self.layers:
-            x = layer(x, positions)
+        is_prefill = positions.shape[0] != 1
+        for idx, layer in enumerate(self.layers):
+            skip_layer = True if idx not in self.skip_layers and is_prefill else False
+            if skip_layer:
+                layer(x, positions, skip_layer=skip_layer)
+            else:
+                x = layer(x, positions, skip_layer=skip_layer)
         x = self.norm(x)
         return x
 

@@ -277,6 +277,7 @@ class TritonAttentionImpl(AttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        skip_layer: Optional[bool] = False,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -345,7 +346,8 @@ class TritonAttentionImpl(AttentionImpl):
                     layer._k_scale,
                     layer._v_scale,
                 )
-
+        if skip_layer:
+            return
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
