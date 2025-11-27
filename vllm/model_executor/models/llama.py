@@ -30,6 +30,10 @@ import os
 
 import torch
 from torch import nn
+import os
+import torch
+import torch.nn.functional as F
+
 from transformers import LlamaConfig
 
 from vllm.attention.backends.abstract import AttentionType
@@ -451,30 +455,51 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+                hidden_states = inputs_embeds        # [T, D]
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden_states = intermediate_tensors["hidden_states"]     # [T, D]
+            residual = intermediate_tensors["residual"]               # [T, D]
 
         aux_hidden_states = []
+
+        # NEW: store CPU copies ONLY – no big lists of GPU tensors
+        reps_for_cos_cpu = []    # full representation: hidden_states + residual  (per layer)
+        deltas_for_cos_cpu = []  # raw hidden_states (per layer, without residual)
+
         is_prefill = positions.shape[0] != 1
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+
             skip_layer = True if idx not in self.skip_layers and is_prefill else False
-            # if skip_layer:
-            #     print(f"Skipping layer {idx}, shape {positions.shape}")
-            # print(f"Layer idx {idx}")
+
             hidden_states, residual = layer(positions, hidden_states, residual, skip_layer)
-            # print(f"shape {hidden_states.shape}")
+            # hidden_states: [T, D], residual: [T, D] or None
+
+            # (A) delta only (no residual) – clone to CPU
+            delta_cpu = hidden_states.detach().to("cpu")
+            deltas_for_cos_cpu.append(delta_cpu)
+
+            # (B) full representation (with residual) – clone to CPU
+            if residual is None:
+                rep = hidden_states            # [T, D]
+            else:
+                rep = hidden_states + residual # [T, D]
+
+            rep_cpu = rep.detach().to("cpu")
+            reps_for_cos_cpu.append(rep_cpu)
+
+            # IMPORTANT: we DO NOT keep extra refs to rep/delta on GPU
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -482,6 +507,77 @@ class LlamaModel(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # --------------- COSINE METRICS BLOCK (CPU) ---------------
+        if len(reps_for_cos_cpu) > 1 and is_prefill:
+            with torch.no_grad():
+                # reps_for_cos_cpu: list of [T, D] CPU tensors  -> [L, T, D]
+                stacked_rep = torch.stack(reps_for_cos_cpu, dim=0)   # [L, T, D] on CPU
+                L, T, D = stacked_rep.shape
+
+                # === 1) consecutive cosine (with residual) -> [L-1, T] ===
+                cos_consec_rep = []
+                for l in range(L - 1):
+                    cs = F.cosine_similarity(
+                        stacked_rep[l],       # [T, D]
+                        stacked_rep[l + 1],   # [T, D]
+                        dim=-1
+                    )                         # [T]
+                    cos_consec_rep.append(cs.unsqueeze(0))  # [1, T]
+                cos_consec_rep = torch.cat(cos_consec_rep, dim=0)  # [L-1, T]
+
+                # === 2) full layer-wise cosine (with residual) -> [T, L, L] ===
+                # [L, T, D] -> [T, L, D]
+                tld_rep = stacked_rep.permute(1, 0, 2)    # [T, L, D]
+                T, L, D = tld_rep.shape
+
+                tld_rep_norm = F.normalize(tld_rep, p=2, dim=-1)  # [T, L, D], still on CPU
+                cos_full_rep = torch.matmul(
+                    tld_rep_norm,
+                    tld_rep_norm.transpose(-1, -2)
+                )  # [T, L, L] on CPU
+
+                # === 3) full layer-wise cosine WITHOUT residual (deltas) -> [T, L, L] ===
+                stacked_delta = torch.stack(deltas_for_cos_cpu, dim=0)  # [L, T, D] CPU
+                tld_delta = stacked_delta.permute(1, 0, 2)              # [T, L, D] CPU
+                tld_delta_norm = F.normalize(tld_delta, p=2, dim=-1)    # [T, L, D] CPU
+
+                cos_full_delta = torch.matmul(
+                    tld_delta_norm,
+                    tld_delta_norm.transpose(-1, -2)
+                )  # [T, L, L] CPU
+
+                # everything is already on CPU, but detach+float for safety
+                cos_consec_rep_cpu = cos_consec_rep.detach().float()
+                cos_full_rep_cpu   = cos_full_rep.detach().float()
+                cos_full_delta_cpu = cos_full_delta.detach().float()
+
+                if not hasattr(self, "_cosine_dump_idx"):
+                    self._cosine_dump_idx = 0
+                dump_idx = self._cosine_dump_idx
+                self._cosine_dump_idx += 1
+
+                out_dir = getattr(self, "cosine_dump_dir", "/host/data/ayadav/logs/")
+                os.makedirs(out_dir, exist_ok=True)
+
+                out_path = os.path.join(out_dir, f"cosine_{dump_idx:06d}.pt")
+                torch.save(
+                    {
+                        # with residual
+                        "cosine_consecutive_rep": cos_consec_rep_cpu,  # [L-1, T]
+                        "cosine_full_rep":        cos_full_rep_cpu,    # [T, L, L]
+
+                        # without residual (per-layer deltas)
+                        "cosine_full_delta":      cos_full_delta_cpu,  # [T, L, L]
+                        "input_ids":              token_ids_cpu,
+
+                        "num_layers": L,
+                        "start_layer": self.start_layer,
+                        "end_layer": self.end_layer,
+                    },
+                    out_path,
+                )
+        # --------------- END COSINE METRICS BLOCK ---------------
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
