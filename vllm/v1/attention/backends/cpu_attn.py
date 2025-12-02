@@ -273,6 +273,7 @@ class CPUAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        skip_layer: Optional[bool] = False,
     ) -> torch.Tensor:
         """Forward pass for CPU attention backend.
 
@@ -326,6 +327,117 @@ class CPUAttentionBackendImpl(AttentionImpl):
             ops.cpu_attn_reshape_and_cache(
                 key,
                 value,
+            return query
+
+        attn_type = self.attn_type
+        if (attn_type == AttentionType.ENCODER
+                and (not attn_metadata.is_all_encoder_attn_metadata_set)):
+            raise AttributeError("Encoder attention requires setting "
+                                 "encoder metadata attributes.")
+        elif (attn_type == AttentionType.ENCODER_DECODER
+              and (not attn_metadata.is_all_cross_attn_metadata_set)):
+            raise AttributeError("Encoder/decoder cross-attention "
+                                 "requires setting cross-attention "
+                                 "metadata attributes.")
+
+        # Reshape the query, key, and value tensors.
+        query = query.view(-1, self.num_heads, self.head_size)
+        if key is not None:
+            assert value is not None
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+            value = value.view(-1, self.num_kv_heads, self.head_size)
+        else:
+            assert value is None
+        if skip_layer:
+            return None
+        if (attn_type != AttentionType.ENCODER and kv_cache.numel() > 0):
+            # KV-cache during decoder-self- or
+            # encoder-decoder-cross-attention, but not
+            # during encoder attention.
+            #
+            # Even if there are no new key/value pairs to cache,
+            # we still need to break out key_cache and value_cache
+            # i.e. for later use by paged attention
+            key_cache, value_cache = self.paged_attn_impl.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size)
+
+            if (key is not None) and (value is not None):
+                if attn_type == AttentionType.ENCODER_DECODER:
+                    # Update cross-attention KV cache (prefill-only)
+                    # During cross-attention decode, key & value will be None,
+                    # preventing this IF-statement branch from running
+                    updated_slot_mapping = attn_metadata.cross_slot_mapping
+                else:
+                    # Update self-attention KV cache (prefill/decode)
+                    updated_slot_mapping = attn_metadata.slot_mapping
+
+                self.paged_attn_impl.write_to_paged_cache(
+                    key, value, key_cache, value_cache, updated_slot_mapping,
+                    self.kv_cache_dtype, layer._k_scale, layer._v_scale)
+
+        if attn_type != AttentionType.ENCODER:
+            # Decoder self-attention supports chunked prefill.
+            # Encoder/decoder cross-attention requires no chunked
+            # prefill (100% prefill or 100% decode tokens, no mix)
+            num_prefill_tokens = attn_metadata.num_prefill_tokens
+            num_decode_tokens = attn_metadata.num_decode_tokens
+        else:
+            # Encoder attention - chunked prefill is not applicable;
+            # derive token-count from query shape & and treat them
+            # as 100% prefill tokens
+            assert attn_metadata.num_encoder_tokens is not None
+            num_prefill_tokens = attn_metadata.num_encoder_tokens
+            num_decode_tokens = 0
+
+        if attn_type == AttentionType.DECODER:
+            # Only enforce this shape-constraint for decoder
+            # self-attention
+            assert key.shape[0] == num_prefill_tokens + num_decode_tokens
+            assert value.shape[0] == num_prefill_tokens + num_decode_tokens
+
+        output = torch.empty_like(query)
+        if prefill_meta := attn_metadata.prefill_metadata:
+            if not prefill_meta.prefill_metadata.chunked_prefill:  # type: ignore
+                assert attn_metadata.seq_lens is not None
+                self._run_sdpa_forward(output,
+                                       query,
+                                       key,
+                                       value,
+                                       prefill_meta,
+                                       attn_type=attn_type)
+            else:
+                # prefix-enabled attention
+                assert not self.need_mask
+                import intel_extension_for_pytorch.llm.modules as ipex_modules
+                output = torch.empty_like(query)
+                ipex_modules.PagedAttention.flash_attn_varlen_func(
+                    output[:prefill_meta.num_prefill_tokens, :, :],
+                    query[:prefill_meta.num_prefill_tokens, :, :],
+                    key_cache,
+                    value_cache,
+                    prefill_meta.prefill_query_start_loc,
+                    prefill_meta.kv_start_loc,
+                    prefill_meta.max_query_len,
+                    prefill_meta.max_kv_len,
+                    self.scale,
+                    True,
+                    prefill_meta.prefill_block_tables,
+                    self.alibi_slopes,
+                )
+
+        if decode_meta := attn_metadata.decode_metadata:
+            assert attn_type != AttentionType.ENCODER_ONLY, (
+                "Encoder-only models should not have decode metadata.")
+            # Decoding run.
+            (
+                seq_lens_arg,
+                max_seq_len_arg,
+                block_tables_arg,
+            ) = decode_meta.get_seq_len_block_table_args(attn_type)
+
+            self.paged_attn_impl.forward_decode(
+                output[attn_metadata.num_prefill_tokens:, :, :],
+                query[attn_metadata.num_prefill_tokens:, :, :],
                 key_cache,
                 value_cache,
                 attn_metadata.slot_mapping,
