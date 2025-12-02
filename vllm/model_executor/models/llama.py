@@ -527,7 +527,6 @@ class LlamaModel(nn.Module):
                 cos_consec_rep = torch.cat(cos_consec_rep, dim=0)  # [L-1, T]
 
                 # === 2) full layer-wise cosine (with residual) -> [T, L, L] ===
-                # [L, T, D] -> [T, L, D]
                 tld_rep = stacked_rep.permute(1, 0, 2)    # [T, L, D]
                 T, L, D = tld_rep.shape
 
@@ -547,11 +546,28 @@ class LlamaModel(nn.Module):
                     tld_delta_norm.transpose(-1, -2)
                 )  # [T, L, L] CPU
 
-                # everything is already on CPU, but detach+float for safety
-                cos_consec_rep_cpu = cos_consec_rep.detach().float()
-                cos_full_rep_cpu   = cos_full_rep.detach().float()
-                cos_full_delta_cpu = cos_full_delta.detach().float()
+                    # === 4) relative magnitude between consecutive layers (with residual) -> [L-1, T] ===
+                # h_in = stacked_rep[l-1], h_out = stacked_rep[l]
+                # rel_mag_rep[l-1, t] = ||h_out - h_in|| / ||h_in||
+                delta_rep = stacked_rep[1:] - stacked_rep[:-1]          # [L-1, T, D]
+                num_rep = delta_rep.norm(dim=-1)                       # [L-1, T]
+                den_rep = stacked_rep[:-1].norm(dim=-1) + 1e-12        # [L-1, T]
+                rel_mag_rep = (num_rep / den_rep)                      # [L-1, T]
 
+                # === 5) relative magnitude for delta-only representation -> [L-1, T] ===
+                delta_delta = stacked_delta[1:] - stacked_delta[:-1]   # [L-1, T, D]
+                num_delta = delta_delta.norm(dim=-1)                   # [L-1, T]
+                den_delta = stacked_delta[:-1].norm(dim=-1) + 1e-12    # [L-1, T]
+                rel_mag_delta = (num_delta / den_delta)                # [L-1, T]
+                
+
+                                # everything is already on CPU, but detach+float for safety
+                cos_consec_rep_cpu   = cos_consec_rep.detach().float()
+                cos_full_rep_cpu     = cos_full_rep.detach().float()
+                cos_full_delta_cpu   = cos_full_delta.detach().float()
+                rel_mag_rep_cpu      = rel_mag_rep.detach().float()      # [L-1, T]
+                rel_mag_delta_cpu    = rel_mag_delta.detach().float()    # [L-1, T]
+                
                 if not hasattr(self, "_cosine_dump_idx"):
                     self._cosine_dump_idx = 0
                 dump_idx = self._cosine_dump_idx
@@ -564,16 +580,20 @@ class LlamaModel(nn.Module):
                 torch.save(
                     {
                         # with residual
-                        "cosine_consecutive_rep": cos_consec_rep_cpu,  # [L-1, T]
-                        "cosine_full_rep":        cos_full_rep_cpu,    # [T, L, L]
+                        "cosine_consecutive_rep": cos_consec_rep_cpu,   # [L-1, T]
+                        "cosine_full_rep":        cos_full_rep_cpu,     # [T, L, L]
 
                         # without residual (per-layer deltas)
-                        "cosine_full_delta":      cos_full_delta_cpu,  # [T, L, L]
-                        "input_ids":              token_ids_cpu,
+                        "cosine_full_delta":      cos_full_delta_cpu,   # [T, L, L]
 
-                        "num_layers": L,
-                        "start_layer": self.start_layer,
-                        "end_layer": self.end_layer,
+                        # relative magnitude (with & without residual)
+                        "relative_magnitude_rep":   rel_mag_rep_cpu,    # [L-1, T]
+                        "relative_magnitude_delta": rel_mag_delta_cpu,  # [L-1, T]
+
+                        "input_ids":              token_ids_cpu,
+                        "num_layers":             L,
+                        "start_layer":            self.start_layer,
+                        "end_layer":              self.end_layer,
                     },
                     out_path,
                 )
