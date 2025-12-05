@@ -434,9 +434,9 @@ class LlamaModel(nn.Module):
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
         
         self.skip_layers = {}
         
@@ -511,6 +511,7 @@ class LlamaModel(nn.Module):
         # --------------- COSINE METRICS BLOCK (CPU) ---------------
         if len(reps_for_cos_cpu) > 1 and is_prefill:
             with torch.no_grad():
+                token_ids_cpu = input_ids.clone().cpu()
                 # reps_for_cos_cpu: list of [T, D] CPU tensors  -> [L, T, D]
                 stacked_rep = torch.stack(reps_for_cos_cpu, dim=0)   # [L, T, D] on CPU
                 L, T, D = stacked_rep.shape

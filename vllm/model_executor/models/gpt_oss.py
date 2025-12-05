@@ -228,7 +228,8 @@ class TransformerBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        residual: torch.Tensor, skip_layer: bool = False | None,
+        residual: torch.Tensor | None, 
+        skip_layer: bool = False ,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -279,19 +280,7 @@ class GptOssModel(nn.Module):
             for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
                 self.skip_layers[int(layer_id.strip())] = True
                 print(f"Layer not skipped init: {int(layer_id.strip())}")
-
-
-    def forward(self, input_ids: torch.Tensor,
-                positions: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(input_ids)
-        is_prefill = positions.shape[0] != 1
-        for idx, layer in enumerate(self.layers):
-            skip_layer = True if idx not in self.skip_layers and is_prefill else False
-            if skip_layer:
-                layer(x, positions, skip_layer=skip_layer)
-            else:
-                x = layer(x, positions, skip_layer=skip_layer)
-        x = self.norm(x)
+    
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
@@ -320,11 +309,16 @@ class GptOssModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        is_prefill = positions.shape[0] != 1
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            skip_layer = True if i not in self.skip_layers and is_prefill else False
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
-            x, residual = layer(x, positions, residual)
+                if skip_layer:
+                    layer(x, positions, residual, skip_layer=skip_layer)
+                else:
+                    x, residual = layer(x, positions, residual, skip_layer=skip_layer)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
         x, _ = self.norm(x, residual)

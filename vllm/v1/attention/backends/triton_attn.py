@@ -273,7 +273,7 @@ class TritonAttentionImpl(AttentionImpl):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
-        skip_layer: Optional[bool] = False,
+        skip_layer: bool = False,
     ) -> torch.Tensor:
         """Forward pass with Paged Attention impl. in Triton.
 

@@ -315,7 +315,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
-        output_shape: Optional[torch.Size] = None,
+        output_shape: torch.Size = None,
         skip_layer: bool = False,
     ) -> torch.Tensor:
         """
@@ -882,7 +882,7 @@ def unified_attention_with_output(
         attn_metadata,
         output=output,
         output_scale=output_scale,
-                      skip_layer=skip_layer,,
+                      skip_layer=skip_layer,
         output_block_scale=output_block_scale,
     )
 
