@@ -243,7 +243,6 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        skip_layer: bool,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -251,11 +250,9 @@ class LlamaAttention(nn.Module):
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
-        attn_output = self.attn(q, k, v, skip_layer=skip_layer)
-        if skip_layer:
-            return None
+        attn_output, actual_tokens = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, actual_tokens
 
     def _init_rotary_emb(
         self,
@@ -344,38 +341,41 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        skip_layer: bool,
+        skip_mode: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        # print(hidden_states.shape)
-        if skip_layer:
-            hidden_states_old, residual_old = hidden_states.clone(), residual.clone()
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual)
-            self.self_attn(positions=positions,
-                                        hidden_states=hidden_states,
-                                        skip_layer=skip_layer)
-    
-            return hidden_states_old, residual_old
-        else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual)
-            hidden_states = self.self_attn(positions=positions,
-                                        hidden_states=hidden_states,
-                                        skip_layer=skip_layer)
 
-            # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(
+        hidden_states_old, residual_old = None, None
+        
+        if residual is None:
+            if skip_mode > 0:   
+                hidden_states_old = hidden_states.clone()
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            if skip_mode > 0:
+                hidden_states_old, residual_old = hidden_states.clone(), residual.clone()
+            hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-            hidden_states = self.mlp(hidden_states)
+        
+        hidden_states, decode_tokens = self.self_attn(positions=positions,
+                                    hidden_states=hidden_states,)
+        
+        print(f"Decode tokens {decode_tokens}, hidden_states {hidden_states.shape}")
+        if skip_mode == 1: # only attention
+            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+
+        if skip_mode == 2: # attention + FFN
+            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
+            if residual_old is not None:
+                residual[decode_tokens:] = residual_old[decode_tokens:]
+        
+        print(f"323, hidden_states {hidden_states.shape}")
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -440,10 +440,11 @@ class LlamaModel(nn.Module):
         
         self.skip_layers = {}
         
-        if "SKIP_LAYERS_CUSTOM" in os.environ:
-            for layer_id in os.environ["SKIP_LAYERS_CUSTOM"][1:-1].split(","):
-                self.skip_layers[int(layer_id.strip())] = True
-                print(f"Layer skipped init: {int(layer_id.strip())}")
+        if "SKIP_LAYERS_MODE" in os.environ:
+            for layer_and_mode in os.environ["SKIP_LAYERS_MODE"][1:-1].split(","):
+                layer, mode = [int(i) for i in layer_and_mode.split(":")]
+                self.skip_layers[layer] = mode
+                print(f"Layer {layer} mode {mode}")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -481,9 +482,8 @@ class LlamaModel(nn.Module):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
 
-            skip_layer = True if idx not in self.skip_layers and is_prefill else False
 
-            hidden_states, residual = layer(positions, hidden_states, residual, skip_layer)
+            hidden_states, residual = layer(positions, hidden_states, residual, self.skip_layers[idx])
             # hidden_states: [T, D], residual: [T, D] or None
 
             # (A) delta only (no residual) – clone to CPU
@@ -508,97 +508,97 @@ class LlamaModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        # --------------- COSINE METRICS BLOCK (CPU) ---------------
-        if len(reps_for_cos_cpu) > 1 and is_prefill:
-            with torch.no_grad():
-                token_ids_cpu = input_ids.clone().cpu()
-                # reps_for_cos_cpu: list of [T, D] CPU tensors  -> [L, T, D]
-                stacked_rep = torch.stack(reps_for_cos_cpu, dim=0)   # [L, T, D] on CPU
-                L, T, D = stacked_rep.shape
+        # # --------------- COSINE METRICS BLOCK (CPU) ---------------
+        # if len(reps_for_cos_cpu) > 1 and is_prefill:
+        #     with torch.no_grad():
+        #         token_ids_cpu = input_ids.clone().cpu()
+        #         # reps_for_cos_cpu: list of [T, D] CPU tensors  -> [L, T, D]
+        #         stacked_rep = torch.stack(reps_for_cos_cpu, dim=0)   # [L, T, D] on CPU
+        #         L, T, D = stacked_rep.shape
 
-                # === 1) consecutive cosine (with residual) -> [L-1, T] ===
-                cos_consec_rep = []
-                for l in range(L - 1):
-                    cs = F.cosine_similarity(
-                        stacked_rep[l],       # [T, D]
-                        stacked_rep[l + 1],   # [T, D]
-                        dim=-1
-                    )                         # [T]
-                    cos_consec_rep.append(cs.unsqueeze(0))  # [1, T]
-                cos_consec_rep = torch.cat(cos_consec_rep, dim=0)  # [L-1, T]
+        #         # === 1) consecutive cosine (with residual) -> [L-1, T] ===
+        #         cos_consec_rep = []
+        #         for l in range(L - 1):
+        #             cs = F.cosine_similarity(
+        #                 stacked_rep[l],       # [T, D]
+        #                 stacked_rep[l + 1],   # [T, D]
+        #                 dim=-1
+        #             )                         # [T]
+        #             cos_consec_rep.append(cs.unsqueeze(0))  # [1, T]
+        #         cos_consec_rep = torch.cat(cos_consec_rep, dim=0)  # [L-1, T]
 
-                # === 2) full layer-wise cosine (with residual) -> [T, L, L] ===
-                tld_rep = stacked_rep.permute(1, 0, 2)    # [T, L, D]
-                T, L, D = tld_rep.shape
+        #         # === 2) full layer-wise cosine (with residual) -> [T, L, L] ===
+        #         tld_rep = stacked_rep.permute(1, 0, 2)    # [T, L, D]
+        #         T, L, D = tld_rep.shape
 
-                tld_rep_norm = F.normalize(tld_rep, p=2, dim=-1)  # [T, L, D], still on CPU
-                cos_full_rep = torch.matmul(
-                    tld_rep_norm,
-                    tld_rep_norm.transpose(-1, -2)
-                )  # [T, L, L] on CPU
+        #         tld_rep_norm = F.normalize(tld_rep, p=2, dim=-1)  # [T, L, D], still on CPU
+        #         cos_full_rep = torch.matmul(
+        #             tld_rep_norm,
+        #             tld_rep_norm.transpose(-1, -2)
+        #         )  # [T, L, L] on CPU
 
-                # === 3) full layer-wise cosine WITHOUT residual (deltas) -> [T, L, L] ===
-                stacked_delta = torch.stack(deltas_for_cos_cpu, dim=0)  # [L, T, D] CPU
-                tld_delta = stacked_delta.permute(1, 0, 2)              # [T, L, D] CPU
-                tld_delta_norm = F.normalize(tld_delta, p=2, dim=-1)    # [T, L, D] CPU
+        #         # === 3) full layer-wise cosine WITHOUT residual (deltas) -> [T, L, L] ===
+        #         stacked_delta = torch.stack(deltas_for_cos_cpu, dim=0)  # [L, T, D] CPU
+        #         tld_delta = stacked_delta.permute(1, 0, 2)              # [T, L, D] CPU
+        #         tld_delta_norm = F.normalize(tld_delta, p=2, dim=-1)    # [T, L, D] CPU
 
-                cos_full_delta = torch.matmul(
-                    tld_delta_norm,
-                    tld_delta_norm.transpose(-1, -2)
-                )  # [T, L, L] CPU
+        #         cos_full_delta = torch.matmul(
+        #             tld_delta_norm,
+        #             tld_delta_norm.transpose(-1, -2)
+        #         )  # [T, L, L] CPU
 
-                    # === 4) relative magnitude between consecutive layers (with residual) -> [L-1, T] ===
-                # h_in = stacked_rep[l-1], h_out = stacked_rep[l]
-                # rel_mag_rep[l-1, t] = ||h_out - h_in|| / ||h_in||
-                delta_rep = stacked_rep[1:] - stacked_rep[:-1]          # [L-1, T, D]
-                num_rep = delta_rep.norm(dim=-1)                       # [L-1, T]
-                den_rep = stacked_rep[:-1].norm(dim=-1) + 1e-12        # [L-1, T]
-                rel_mag_rep = (num_rep / den_rep)                      # [L-1, T]
+        #             # === 4) relative magnitude between consecutive layers (with residual) -> [L-1, T] ===
+        #         # h_in = stacked_rep[l-1], h_out = stacked_rep[l]
+        #         # rel_mag_rep[l-1, t] = ||h_out - h_in|| / ||h_in||
+        #         delta_rep = stacked_rep[1:] - stacked_rep[:-1]          # [L-1, T, D]
+        #         num_rep = delta_rep.norm(dim=-1)                       # [L-1, T]
+        #         den_rep = stacked_rep[:-1].norm(dim=-1) + 1e-12        # [L-1, T]
+        #         rel_mag_rep = (num_rep / den_rep)                      # [L-1, T]
 
-                # === 5) relative magnitude for delta-only representation -> [L-1, T] ===
-                delta_delta = stacked_delta[1:] - stacked_delta[:-1]   # [L-1, T, D]
-                num_delta = delta_delta.norm(dim=-1)                   # [L-1, T]
-                den_delta = stacked_delta[:-1].norm(dim=-1) + 1e-12    # [L-1, T]
-                rel_mag_delta = (num_delta / den_delta)                # [L-1, T]
+        #         # === 5) relative magnitude for delta-only representation -> [L-1, T] ===
+        #         delta_delta = stacked_delta[1:] - stacked_delta[:-1]   # [L-1, T, D]
+        #         num_delta = delta_delta.norm(dim=-1)                   # [L-1, T]
+        #         den_delta = stacked_delta[:-1].norm(dim=-1) + 1e-12    # [L-1, T]
+        #         rel_mag_delta = (num_delta / den_delta)                # [L-1, T]
                 
 
-                                # everything is already on CPU, but detach+float for safety
-                cos_consec_rep_cpu   = cos_consec_rep.detach().float()
-                cos_full_rep_cpu     = cos_full_rep.detach().float()
-                cos_full_delta_cpu   = cos_full_delta.detach().float()
-                rel_mag_rep_cpu      = rel_mag_rep.detach().float()      # [L-1, T]
-                rel_mag_delta_cpu    = rel_mag_delta.detach().float()    # [L-1, T]
+        #                         # everything is already on CPU, but detach+float for safety
+        #         cos_consec_rep_cpu   = cos_consec_rep.detach().float()
+        #         cos_full_rep_cpu     = cos_full_rep.detach().float()
+        #         cos_full_delta_cpu   = cos_full_delta.detach().float()
+        #         rel_mag_rep_cpu      = rel_mag_rep.detach().float()      # [L-1, T]
+        #         rel_mag_delta_cpu    = rel_mag_delta.detach().float()    # [L-1, T]
                 
-                if not hasattr(self, "_cosine_dump_idx"):
-                    self._cosine_dump_idx = 0
-                dump_idx = self._cosine_dump_idx
-                self._cosine_dump_idx += 1
+        #         if not hasattr(self, "_cosine_dump_idx"):
+        #             self._cosine_dump_idx = 0
+        #         dump_idx = self._cosine_dump_idx
+        #         self._cosine_dump_idx += 1
 
-                out_dir = getattr(self, "cosine_dump_dir", "/host/data/ayadav/logs/")
-                os.makedirs(out_dir, exist_ok=True)
+        #         out_dir = getattr(self, "cosine_dump_dir", "/host/data/ayadav/logs/")
+        #         os.makedirs(out_dir, exist_ok=True)
 
-                out_path = os.path.join(out_dir, f"cosine_{dump_idx:06d}.pt")
-                torch.save(
-                    {
-                        # with residual
-                        "cosine_consecutive_rep": cos_consec_rep_cpu,   # [L-1, T]
-                        "cosine_full_rep":        cos_full_rep_cpu,     # [T, L, L]
+        #         out_path = os.path.join(out_dir, f"cosine_{dump_idx:06d}.pt")
+        #         torch.save(
+        #             {
+        #                 # with residual
+        #                 "cosine_consecutive_rep": cos_consec_rep_cpu,   # [L-1, T]
+        #                 "cosine_full_rep":        cos_full_rep_cpu,     # [T, L, L]
 
-                        # without residual (per-layer deltas)
-                        "cosine_full_delta":      cos_full_delta_cpu,   # [T, L, L]
+        #                 # without residual (per-layer deltas)
+        #                 "cosine_full_delta":      cos_full_delta_cpu,   # [T, L, L]
 
-                        # relative magnitude (with & without residual)
-                        "relative_magnitude_rep":   rel_mag_rep_cpu,    # [L-1, T]
-                        "relative_magnitude_delta": rel_mag_delta_cpu,  # [L-1, T]
+        #                 # relative magnitude (with & without residual)
+        #                 "relative_magnitude_rep":   rel_mag_rep_cpu,    # [L-1, T]
+        #                 "relative_magnitude_delta": rel_mag_delta_cpu,  # [L-1, T]
 
-                        "input_ids":              token_ids_cpu,
-                        "num_layers":             L,
-                        "start_layer":            self.start_layer,
-                        "end_layer":              self.end_layer,
-                    },
-                    out_path,
-                )
-        # --------------- END COSINE METRICS BLOCK ---------------
+        #                 "input_ids":              token_ids_cpu,
+        #                 "num_layers":             L,
+        #                 "start_layer":            self.start_layer,
+        #                 "end_layer":              self.end_layer,
+        #             },
+        #             out_path,
+        #         )
+        # # --------------- END COSINE METRICS BLOCK ---------------
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states

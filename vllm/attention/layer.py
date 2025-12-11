@@ -316,7 +316,6 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size = None,
-        skip_layer: bool = False,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -364,12 +363,13 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )
-                assert not(skip_layer)
             else:
+                metadata = torch.Tensor([0])
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name, skip_layer=skip_layer
+                    query, key, value, output, self.layer_name, metadata = metadata
                 )
-            return output.view(-1, hidden_size)
+                print(f"Verification {metadata}")
+            return output.view(-1, hidden_size), int(metadata[0].item())
         else:
             if self.use_direct_call:
                 forward_context = get_forward_context()
@@ -378,13 +378,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
 
-                assert not(skip_layer)
                 return self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata
                 )
             else:
                 return torch.ops.vllm.unified_attention(
-                    query, key, value, self.layer_name, skip_layer=skip_layer
+                    query, key, value, self.layer_name
                 )
 
     def calc_kv_scales(self, query, key, value):
@@ -836,12 +835,11 @@ def unified_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
-    skip_layer: bool = False
 ) -> torch.Tensor:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata, skip_layer=skip_layer,)
+    output, tokens = self.impl.forward(self, query, key, value, kv_cache, attn_metadata,)
 
-    return output
+    return output, tokens
 
 
 def unified_attention_fake(
@@ -849,9 +847,8 @@ def unified_attention_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
-    skip_layer: bool = False
 ) -> torch.Tensor:
-    return torch.empty_like(query).contiguous()
+    return torch.empty_like(query).contiguous(), 0
 
 
 direct_register_custom_op(
@@ -860,7 +857,7 @@ direct_register_custom_op(
     fake_impl=unified_attention_fake,
 )
 
-
+from typing import Optional, List
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
     query: torch.Tensor,
@@ -870,10 +867,10 @@ def unified_attention_with_output(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
-    skip_layer: bool = False
+    metadata: torch.Tensor = None,
 ) -> None:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    self.impl.forward(
+    output, tokens = self.impl.forward(
         self,
         query,
         key,
@@ -882,9 +879,11 @@ def unified_attention_with_output(
         attn_metadata,
         output=output,
         output_scale=output_scale,
-                      skip_layer=skip_layer,
         output_block_scale=output_block_scale,
     )
+    metadata[0] = tokens
+
+
 
 
 def unified_attention_with_output_fake(
@@ -895,7 +894,7 @@ def unified_attention_with_output_fake(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
-    skip_layer: bool = False
+    metadata: torch.Tensor = None,
 ) -> None:
     return
 

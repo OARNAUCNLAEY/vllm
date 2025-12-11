@@ -238,9 +238,8 @@ class TransformerBlock(torch.nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.attn(hidden_states, positions, skip_layer=skip_layer)
-        if attn_output is None:
+        if hidden_states is None:
             return None
-
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         output = self.mlp(hidden_states)
@@ -301,31 +300,148 @@ class GptOssModel(nn.Module):
                 x = inputs_embeds
             else:
                 x = self.embed_input_ids(input_ids)
-
             residual = None
         else:
             assert intermediate_tensors is not None
             x = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_hidden_states: list[torch.Tensor] = []
+
+        # NEW: store CPU copies ONLY – no big lists of GPU tensors
+        reps_for_cos_cpu: list[torch.Tensor] = []    # x (+ residual) per layer
+        deltas_for_cos_cpu: list[torch.Tensor] = []  # raw x per layer (delta-only)
+
         is_prefill = positions.shape[0] != 1
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            skip_layer = True if i not in self.skip_layers and is_prefill else False
+
+            # Save aux hidden states if requested
             if i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x if residual is None else x + residual)
-                if skip_layer:
-                    layer(x, positions, residual, skip_layer=skip_layer)
-                else:
-                    x, residual = layer(x, positions, residual, skip_layer=skip_layer)
+
+            skip_layer = True if i not in self.skip_layers and is_prefill else False
+
+            # Run layer (handles skip_layer internally, returns (x, residual))
+            x, residual = layer(x, positions, residual, skip_layer=skip_layer)
+
+            # --- Collect per-layer representations on CPU for cosine metrics ---
+            # (A) delta-only (no residual)
+            delta_cpu = x.detach().to("cpu")
+            deltas_for_cos_cpu.append(delta_cpu)
+
+            # (B) full representation (with residual)
+            if residual is None:
+                rep = x
+            else:
+                rep = x + residual
+            rep_cpu = rep.detach().to("cpu")
+            reps_for_cos_cpu.append(rep_cpu)
+            # -------------------------------------------------------------------
+
+        # Pipeline parallel: non-last ranks just pass on tensors, no metrics
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": x, "residual": residual})
+
+        # Final RMSNorm on last rank
         x, _ = self.norm(x, residual)
+
+        # --------------- COSINE METRICS BLOCK (CPU) ---------------
+        if len(reps_for_cos_cpu) > 1 and is_prefill:
+            with torch.no_grad():
+                # Input tokens (for debugging/analysis)
+                token_ids_cpu = input_ids.clone().cpu()
+
+                # reps_for_cos_cpu: list of [T, D] -> [L, T, D]
+                stacked_rep = torch.stack(reps_for_cos_cpu, dim=0)  # [L, T, D] (CPU)
+                L, T, D = stacked_rep.shape
+
+                # 1) Consecutive layer cosine similarity (with residual) -> [L-1, T]
+                cos_consec_rep = []
+                for l in range(L - 1):
+                    cs = F.cosine_similarity(
+                        stacked_rep[l],       # [T, D]
+                        stacked_rep[l + 1],   # [T, D]
+                        dim=-1,
+                    )  # [T]
+                    cos_consec_rep.append(cs.unsqueeze(0))
+                cos_consec_rep = torch.cat(cos_consec_rep, dim=0)  # [L-1, T]
+
+                # 2) Full layer-wise cosine (with residual) -> [T, L, L]
+                tld_rep = stacked_rep.permute(1, 0, 2)       # [T, L, D]
+                T, L, D = tld_rep.shape
+                tld_rep_norm = F.normalize(tld_rep, p=2, dim=-1)  # [T, L, D]
+                cos_full_rep = torch.matmul(
+                    tld_rep_norm,
+                    tld_rep_norm.transpose(-1, -2),
+                )  # [T, L, L]
+
+                # 3) Full layer-wise cosine (delta-only, no residual) -> [T, L, L]
+                stacked_delta = torch.stack(deltas_for_cos_cpu, dim=0)  # [L, T, D]
+                tld_delta = stacked_delta.permute(1, 0, 2)              # [T, L, D]
+                tld_delta_norm = F.normalize(tld_delta, p=2, dim=-1)    # [T, L, D]
+                cos_full_delta = torch.matmul(
+                    tld_delta_norm,
+                    tld_delta_norm.transpose(-1, -2),
+                )  # [T, L, L]
+
+                # 4) Relative magnitude between consecutive layers (with residual)
+                #    rel_mag_rep[l-1, t] = ||h_out - h_in|| / ||h_in||
+                delta_rep = stacked_rep[1:] - stacked_rep[:-1]      # [L-1, T, D]
+                num_rep = delta_rep.norm(dim=-1)                    # [L-1, T]
+                den_rep = stacked_rep[:-1].norm(dim=-1) + 1e-12     # [L-1, T]
+                rel_mag_rep = num_rep / den_rep                     # [L-1, T]
+
+                # 5) Relative magnitude (delta-only)
+                delta_delta = stacked_delta[1:] - stacked_delta[:-1]  # [L-1, T, D]
+                num_delta = delta_delta.norm(dim=-1)                  # [L-1, T]
+                den_delta = stacked_delta[:-1].norm(dim=-1) + 1e-12   # [L-1, T]
+                rel_mag_delta = num_delta / den_delta                 # [L-1, T]
+
+                # Detach/float for safety
+                cos_consec_rep_cpu = cos_consec_rep.detach().float()
+                cos_full_rep_cpu = cos_full_rep.detach().float()
+                cos_full_delta_cpu = cos_full_delta.detach().float()
+                rel_mag_rep_cpu = rel_mag_rep.detach().float()
+                rel_mag_delta_cpu = rel_mag_delta.detach().float()
+
+                # Simple incremental index for file names
+                if not hasattr(self, "_cosine_dump_idx"):
+                    self._cosine_dump_idx = 0
+                dump_idx = self._cosine_dump_idx
+                self._cosine_dump_idx += 1
+
+                out_dir = getattr(self, "cosine_dump_dir", "/host/data/ayadav/logs/gpt_oss/")
+                os.makedirs(out_dir, exist_ok=True)
+
+                out_path = os.path.join(out_dir, f"cosine_{dump_idx:06d}.pt")
+                torch.save(
+                    {
+                        # with residual
+                        "cosine_consecutive_rep": cos_consec_rep_cpu,   # [L-1, T]
+                        "cosine_full_rep": cos_full_rep_cpu,           # [T, L, L]
+
+                        # without residual (deltas)
+                        "cosine_full_delta": cos_full_delta_cpu,       # [T, L, L]
+
+                        # relative magnitude (with & without residual)
+                        "relative_magnitude_rep": rel_mag_rep_cpu,     # [L-1, T]
+                        "relative_magnitude_delta": rel_mag_delta_cpu, # [L-1, T]
+
+                        "input_ids": input_ids.clone().cpu(),
+                        "num_layers": L,
+                        "start_layer": self.start_layer,
+                        "end_layer": self.end_layer,
+                    },
+                    out_path,
+                )
+        # --------------- END COSINE METRICS BLOCK ---------------
 
         if len(aux_hidden_states) > 0:
             return x, aux_hidden_states
         return x
+
 
     def _load_weights_mxfp4(
         self,
