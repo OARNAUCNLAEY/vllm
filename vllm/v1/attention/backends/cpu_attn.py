@@ -23,6 +23,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+import os
+
 logger = init_logger(__name__)
 
 _CPU_ARCH_PREFER_MIXED_BATCH = (CpuArchEnum.X86, CpuArchEnum.ARM)
@@ -98,6 +100,7 @@ class CPUAttentionMetadata:
     num_decode_tokens: int = 0
     sdpa_attn_masks: list[torch.Tensor | None] | None = None
     sdpa_start_loc: torch.Tensor | None = None
+    skip_layer: bool = False
 
 
 class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
@@ -111,7 +114,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         self.use_sdpa_prefill = False
-        reorder_batch_threshold = None
+        reorder_batch_threshold = 1
         if current_platform.get_cpu_architecture() not in _CPU_ARCH_PREFER_MIXED_BATCH:
             # in this case, decode seqs are reordered to the front of prefill seqs
             # to split decode and prefill. Then use SDPA for prefill and
@@ -137,11 +140,30 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         self.block_size = vllm_config.cache_config.block_size
         self.isa = _get_attn_isa(self.dtype, self.block_size)
 
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_MODE" in os.environ:
+            for layer_and_mode in os.environ["SKIP_LAYERS_MODE"][1:-1].split(","):
+                layer, mode = [int(i) for i in layer_and_mode.split(":")]
+                if mode == 0:
+                    self.skip_layers[layer] = mode
+                print(f"Layer {layer} mode {mode}")
+    
+    def can_skip_layer(self, layer_name):
+        for id in self.skip_layers:
+            if f"layers.{id}." in layer_name:
+                return False
+        return True
+    def all_decode(self, query_start_loc):
+        diffs = torch.abs(query_start_loc[1:] - query_start_loc[:-1])
+        is_all_adj_one = torch.all(diffs == 1)
+        return is_all_adj_one.item()
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        layer_name: str = "",
     ) -> CPUAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -170,6 +192,26 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             seq_lens = seq_lens[:num_decodes]
             query_start_loc = query_start_loc[: num_decodes + 1]
             block_table_tensor = block_table_tensor[:num_decodes]
+            # Decoder, need reorder and truncate
+        assert self.reorder_batch_threshold
+        (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
+            )
+        )
+        num_reqs = num_decodes
+        skip_layer = False
+        sdpa_start_loc = sdpa_start_loc[num_decodes:] - num_decode_tokens
+        if self.can_skip_layer(layer_name):
+            print(f"Layer_name skipped {layer_name}")
+            print(f"Metadata updated, number of decodes {num_decodes}")
+            seq_lens = seq_lens[:num_decodes]
+            query_start_loc = query_start_loc[: num_decodes + 1]
+            skip_layer = True
+            block_table_tensor = block_table_tensor[:num_decodes]
+            assert self.all_decode(query_start_loc)
 
         sheduler_metadata = None
         if causal:
@@ -202,6 +244,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             use_sdpa_prefill=self.use_sdpa_prefill,
             num_decode_tokens=num_decode_tokens,
             sdpa_start_loc=sdpa_start_loc,
+            skip_layer=skip_layer,
         )
 
         return attn_metadata
@@ -295,7 +338,7 @@ class CPUAttentionBackendImpl(AttentionImpl):
 
         # For warming-up
         if attn_metadata is None:
-            return output
+            return output, 0
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -309,7 +352,7 @@ class CPUAttentionBackendImpl(AttentionImpl):
                 output[:num_actual_tokens],
                 attn_metadata,
                 self.attn_type,
-            )
+            ), 0
 
         # For decoder and cross-attention, use KV cache, size are
         # [num_blocks, num_kv_heads, block_size, head_size]
@@ -345,6 +388,23 @@ class CPUAttentionBackendImpl(AttentionImpl):
             )
             num_actual_tokens = num_decode_tokens
 
+        num_decode_tokens = 0
+        if attn_metadata.skip_layer:
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            num_actual_tokens = num_decode_tokens
+        #     print(f"Attention skipped actual tokens {num_actual_tokens}")
+        # print(f"query {query.shape}")
+        # print(f"key_cache {key_cache.shape}")
+        # print(f"value_cache {value_cache.shape}")
+        # print(f"output {output.shape}")
+        # print(f"attn_metadata.query_start_loc {attn_metadata.query_start_loc}")
+        # print(f"attn_metadata.seq_lens {attn_metadata.seq_lens}")
+        # print(f"causal matrix {attn_metadata.causal}")
+        # print(f"attention block {attn_metadata.block_table.shape}, {self.sliding_window}")
+        # print(f"attn_metadata.scheduler_metadata {attn_metadata.scheduler_metadata}")
+        # print(f"attn_metadata.num_decode_tokens {attn_metadata.num_decode_tokens}")
+        # # print(f"attn_metadata is 0? {torch.all(attn_metadata.scheduler_metadata == 0)}")
+        # print("Attention metdata done")
         if num_actual_tokens > 0:
             ops.cpu_attention_with_kv_cache(
                 query=query[:num_actual_tokens],
@@ -363,7 +423,7 @@ class CPUAttentionBackendImpl(AttentionImpl):
                 s_aux=self.sinks,
             )
 
-        return output
+        return output, num_decode_tokens
 
     def _run_sdpa_forward(
         self,

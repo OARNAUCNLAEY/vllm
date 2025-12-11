@@ -1689,14 +1689,20 @@ class GPUModelRunner(
                         attn_metadata_i = builder.build_for_cudagraph_capture(
                             common_attn_metadata
                         )
-                    else:
-                        attn_metadata_i = builder.build(
+                    # else:
+                    #     attn_metadata_i = builder.build(
+                    #         common_prefix_len=cascade_attn_prefix_len,
+                    #         common_attn_metadata=common_attn_metadata,
+                    #         **extra_attn_metadata_args,
+                    #     )
+                    
+                    for layer_name in attn_group.layer_names:
+                        extra_attn_metadata_args['layer_name'] = layer_name
+                        attn_metadata[layer_name] = builder.build(
                             common_prefix_len=cascade_attn_prefix_len,
                             common_attn_metadata=common_attn_metadata,
                             **extra_attn_metadata_args,
                         )
-                    for layer_name in attn_group.layer_names:
-                        attn_metadata[layer_name] = attn_metadata_i
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded

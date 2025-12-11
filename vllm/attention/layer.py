@@ -364,10 +364,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )
             else:
+                metadata = torch.Tensor([0])
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name
+                    query, key, value, output, self.layer_name, metadata = metadata
                 )
-            return output.view(-1, hidden_size)
+                print(f"Verification {metadata}")
+            return output.view(-1, hidden_size), int(metadata[0].item())
         else:
             if self.use_direct_call:
                 forward_context = get_forward_context()
@@ -834,9 +836,9 @@ def unified_attention(
     layer_name: str,
 ) -> torch.Tensor:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
+    output, tokens = self.impl.forward(self, query, key, value, kv_cache, attn_metadata,)
 
-    return output
+    return output, tokens
 
 
 def unified_attention_fake(
@@ -845,7 +847,7 @@ def unified_attention_fake(
     value: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return torch.empty_like(query).contiguous()
+    return torch.empty_like(query).contiguous(), 0
 
 
 direct_register_custom_op(
@@ -854,7 +856,7 @@ direct_register_custom_op(
     fake_impl=unified_attention_fake,
 )
 
-
+from typing import Optional, List
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
     query: torch.Tensor,
@@ -864,9 +866,10 @@ def unified_attention_with_output(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
+    metadata: torch.Tensor = None,
 ) -> None:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    self.impl.forward(
+    output, tokens = self.impl.forward(
         self,
         query,
         key,
@@ -877,6 +880,9 @@ def unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
+    metadata[0] = tokens
+
+
 
 
 def unified_attention_with_output_fake(
@@ -887,6 +893,7 @@ def unified_attention_with_output_fake(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
+    metadata: torch.Tensor = None,
 ) -> None:
     return
 

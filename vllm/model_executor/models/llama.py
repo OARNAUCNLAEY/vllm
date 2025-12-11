@@ -26,9 +26,14 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
 
 import torch
 from torch import nn
+import os
+import torch
+import torch.nn.functional as F
+
 from transformers import LlamaConfig
 
 from vllm.attention.backends.abstract import AttentionType
@@ -245,9 +250,9 @@ class LlamaAttention(nn.Module):
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
-        attn_output = self.attn(q, k, v)
+        attn_output, actual_tokens = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, actual_tokens
 
     def _init_rotary_emb(
         self,
@@ -336,18 +341,40 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        skip_mode: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+
+        hidden_states_old, residual_old = None, None
+        
         if residual is None:
+            if skip_mode > 0:   
+                hidden_states_old = hidden_states.clone()
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+            if skip_mode > 0:
+                hidden_states_old, residual_old = hidden_states.clone(), residual.clone()
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        
+        hidden_states, decode_tokens = self.self_attn(positions=positions,
+                                    hidden_states=hidden_states,)
+        
+        # print(f"Decode tokens {decode_tokens}, hidden_states {hidden_states.shape}, mode {skip_mode}")
+        if skip_mode == 1: # only attention
+            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        if skip_mode == 2: # attention + FFN
+            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
+            if residual_old is not None:
+                residual[decode_tokens:] = residual_old[decode_tokens:]
+        
         return hidden_states, residual
 
     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
@@ -409,6 +436,14 @@ class LlamaModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_MODE" in os.environ:
+            for layer_and_mode in os.environ["SKIP_LAYERS_MODE"][1:-1].split(","):
+                layer, mode = [int(i) for i in layer_and_mode.split(":")]
+                self.skip_layers[layer] = mode
+                print(f"Layer {layer} mode {mode}")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -437,7 +472,7 @@ class LlamaModel(nn.Module):
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual, self.skip_layers[idx])
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
