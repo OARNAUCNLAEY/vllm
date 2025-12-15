@@ -201,10 +201,9 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
                 require_uniform=True,
             )
         )
-        num_reqs = num_decodes
         skip_layer = False
-        sdpa_start_loc = sdpa_start_loc[num_decodes:] - num_decode_tokens
         if self.can_skip_layer(layer_name):
+            num_reqs = num_decodes
             seq_lens = seq_lens[:num_decodes]
             query_start_loc = query_start_loc[: num_decodes + 1]
             skip_layer = True
