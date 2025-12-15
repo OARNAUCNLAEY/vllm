@@ -368,7 +368,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name, metadata = metadata
                 )
-                print(f"Verification {metadata}")
             return output.view(-1, hidden_size), int(metadata[0].item())
         else:
             if self.use_direct_call:

@@ -205,8 +205,6 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         skip_layer = False
         sdpa_start_loc = sdpa_start_loc[num_decodes:] - num_decode_tokens
         if self.can_skip_layer(layer_name):
-            print(f"Layer_name skipped {layer_name}")
-            print(f"Metadata updated, number of decodes {num_decodes}")
             seq_lens = seq_lens[:num_decodes]
             query_start_loc = query_start_loc[: num_decodes + 1]
             skip_layer = True
@@ -392,19 +390,6 @@ class CPUAttentionBackendImpl(AttentionImpl):
         if attn_metadata.skip_layer:
             num_decode_tokens = attn_metadata.num_decode_tokens
             num_actual_tokens = num_decode_tokens
-        #     print(f"Attention skipped actual tokens {num_actual_tokens}")
-        # print(f"query {query.shape}")
-        # print(f"key_cache {key_cache.shape}")
-        # print(f"value_cache {value_cache.shape}")
-        # print(f"output {output.shape}")
-        # print(f"attn_metadata.query_start_loc {attn_metadata.query_start_loc}")
-        # print(f"attn_metadata.seq_lens {attn_metadata.seq_lens}")
-        # print(f"causal matrix {attn_metadata.causal}")
-        # print(f"attention block {attn_metadata.block_table.shape}, {self.sliding_window}")
-        # print(f"attn_metadata.scheduler_metadata {attn_metadata.scheduler_metadata}")
-        # print(f"attn_metadata.num_decode_tokens {attn_metadata.num_decode_tokens}")
-        # # print(f"attn_metadata is 0? {torch.all(attn_metadata.scheduler_metadata == 0)}")
-        # print("Attention metdata done")
         if num_actual_tokens > 0:
             ops.cpu_attention_with_kv_cache(
                 query=query[:num_actual_tokens],

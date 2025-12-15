@@ -361,7 +361,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, decode_tokens = self.self_attn(positions=positions,
                                     hidden_states=hidden_states,)
         
-        # print(f"Decode tokens {decode_tokens}, hidden_states {hidden_states.shape}, mode {skip_mode}")
         if skip_mode == 1: # only attention
             hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
 
