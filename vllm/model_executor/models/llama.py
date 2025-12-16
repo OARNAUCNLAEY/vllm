@@ -243,6 +243,7 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        skip_mode=0,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -251,7 +252,10 @@ class LlamaAttention(nn.Module):
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output, actual_tokens = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        total_tokens = attn_output.shape[0]
+        if skip_mode > 0:
+            total_tokens = actual_tokens
+        output, _ = self.o_proj(attn_output[:total_tokens])
         return output, actual_tokens
 
     def _init_rotary_emb(
@@ -359,20 +363,30 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual)
         
         hidden_states, decode_tokens = self.self_attn(positions=positions,
-                                    hidden_states=hidden_states,)
-        
-        if skip_mode == 1: # only attention
-            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
+                                    hidden_states=hidden_states, skip_mode=skip_mode)
+        if skip_mode == 2:
+            residual = residual[:decode_tokens]
+            if decode_tokens != 0:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual[:decode_tokens])
+                hidden_states = self.mlp(hidden_states)
+            
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states_old[hidden_states.shape[0]:]],
+                dim=0
+            )
+            if residual_old is None:
+                residual_old = torch.zeros_like(hidden_states)
+            residual = torch.cat(
+                [residual, residual_old[residual.shape[0]:]],
+                dim=0
+            )
+        else:
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-
-        if skip_mode == 2: # attention + FFN
-            hidden_states[decode_tokens:] = hidden_states_old[decode_tokens:]
-            if residual_old is not None:
-                residual[decode_tokens:] = residual_old[decode_tokens:]
         
         return hidden_states, residual
 
