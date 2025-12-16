@@ -352,15 +352,18 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states_old, residual_old = None, None
         
         if residual is None:
-            if skip_mode > 0:   
+            if skip_mode == 2:   
                 hidden_states_old = hidden_states.clone()
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            if skip_mode > 0:
+            if skip_mode == 2:
                 hidden_states_old, residual_old = hidden_states.clone(), residual.clone()
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        
+        if skip_mode == 1:
+            hidden_states_old = hidden_states.clone()
         
         hidden_states, decode_tokens = self.self_attn(positions=positions,
                                     hidden_states=hidden_states, skip_mode=skip_mode)
@@ -381,6 +384,15 @@ class LlamaDecoderLayer(nn.Module):
                 [residual, residual_old[residual.shape[0]:]],
                 dim=0
             )
+        elif skip_mode == 1:
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states_old[hidden_states.shape[0]:]],
+                dim=0
+            )
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
         else:
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
