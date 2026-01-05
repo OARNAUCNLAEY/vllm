@@ -208,6 +208,16 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             query_start_loc = query_start_loc[: num_decodes + 1]
             skip_layer = True
             block_table_tensor = block_table_tensor[:num_decodes]
+            if query_start_loc.numel() == 0 or query_start_loc.numel() == 1:
+                max_query_len = 0
+            else:
+                max_query_len = int(
+                    torch.max(torch.abs(query_start_loc[1:] - query_start_loc[:-1])).item()
+                )
+            if seq_lens.numel() == 0:
+                max_seq_len = 0
+            else:
+                max_seq_len = int(seq_lens.max().item())
             assert self.all_decode(query_start_loc)
 
         sheduler_metadata = None
@@ -229,7 +239,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
 
         attn_metadata = CPUAttentionMetadata(
             isa=self.isa,
-            num_actual_tokens=num_actual_tokens,
+            num_actual_tokens=num_actual_tokens, #never used
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,

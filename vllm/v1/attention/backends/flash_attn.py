@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from typing import ClassVar
+import os
 
 import numpy as np
 import torch
@@ -45,6 +46,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    split_decodes_and_prefills,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
@@ -212,6 +214,8 @@ class FlashAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
 
+    skip_layer: bool = False
+    num_decode_tokens: int = 0
     causal: bool = True
 
 
@@ -264,7 +268,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
-
+        reorder_batch_threshold = 1
+        self._init_reorder_batch_threshold(reorder_batch_threshold, False)
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
         )
@@ -276,6 +281,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
 
+        self.skip_layers = {}
+        
+        if "SKIP_LAYERS_MODE" in os.environ:
+            for layer_and_mode in os.environ["SKIP_LAYERS_MODE"][1:-1].split(","):
+                layer, mode = [int(i) for i in layer_and_mode.split(":")]
+                if mode == 0:
+                    self.skip_layers[layer] = mode
+                print(f"Layer {layer} mode {mode}")
         try:
             from vllm.distributed.parallel_state import get_dcp_group
 
@@ -309,12 +322,21 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
-
+    def can_skip_layer(self, layer_name):
+        for id in self.skip_layers:
+            if f"layers.{id}." in layer_name:
+                return False
+        return True
+    def all_decode(self, query_start_loc):
+        diffs = torch.abs(query_start_loc[1:] - query_start_loc[:-1])
+        is_all_adj_one = torch.all(diffs == 1)
+        return is_all_adj_one.item()
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        layer_name: str = "",
     ) -> FlashAttentionMetadata:
         """
         fast_build disables AOT scheduling, used when there will be few
@@ -359,6 +381,35 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if vllm_is_batch_invariant():
             max_num_splits = 1
+        (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
+            )
+        )
+
+        skip_layer = False
+        if self.can_skip_layer(layer_name):
+            num_reqs = num_decodes
+
+            seq_lens = seq_lens[:num_decodes]
+            query_start_loc = query_start_loc[: num_decodes + 1]
+            skip_layer = True
+            block_table_tensor = block_table_tensor[:num_decodes]
+            
+            if query_start_loc.numel() == 0 or query_start_loc.numel() == 1:
+                max_query_len = 0
+            else:
+                max_query_len = int(
+                    torch.max(torch.abs(query_start_loc[1:] - query_start_loc[:-1])).item()
+                )
+            if seq_lens.numel() == 0:
+                max_seq_len = 0
+            else:
+                max_seq_len = int(seq_lens.max().item())
+            num_actual_tokens = num_decode_tokens
+            assert self.all_decode(query_start_loc)
 
         def schedule(
             batch_size, cu_query_lens, max_query_len, seqlens, max_seq_len, causal
@@ -471,7 +522,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
-            max_query_len=max_query_len,
+            max_query_len=max_query_len, 
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
@@ -480,13 +531,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
             use_cascade=use_cascade,
-            common_prefix_len=common_prefix_len,
+            common_prefix_len=common_prefix_len, # check
             scheduler_metadata=scheduler_metadata,
-            cu_prefix_query_lens=cu_prefix_query_lens,
+            cu_prefix_query_lens=cu_prefix_query_lens, # check
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
+            skip_layer=skip_layer,
+            num_decode_tokens=num_decode_tokens,
             causal=causal,
         )
         return attn_metadata
@@ -593,7 +646,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
-            return output.fill_(0)
+            return output.fill_(0), 0
 
         attn_type = self.attn_type
 
@@ -619,8 +672,11 @@ class FlashAttentionImpl(AttentionImpl):
                 output[:num_actual_tokens],
                 attn_metadata,
                 layer,
-            )
-
+            ), 0
+        num_decode_tokens = 0
+        if attn_metadata.skip_layer:
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            num_actual_tokens = num_decode_tokens
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
@@ -657,7 +713,8 @@ class FlashAttentionImpl(AttentionImpl):
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
-
+        if num_actual_tokens == 0:
+            return output, num_actual_tokens
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -669,6 +726,7 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             if self.dcp_world_size > 1:
+                assert False
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
@@ -681,7 +739,7 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=layer._k_scale.expand(descale_shape),
                     v_descale=layer._v_scale.expand(descale_shape),
                 )
-                return output
+                return output, num_decode_tokens
             else:
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
@@ -706,7 +764,7 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
-                return output
+                return output, num_decode_tokens
 
         # Cascade attention (rare case).
         cascade_attention(
